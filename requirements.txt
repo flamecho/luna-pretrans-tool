@@ -1,0 +1,4 @@
+# 运行本工具所需的第三方库
+openpyxl>=3.1
+
+# 打包成 exe 时额外需要（可选）：pip install pyinstaller
