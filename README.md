@@ -1,8 +1,6 @@
 # Luna 预翻译工具
 
-面向 **Galgame / 视觉小说** 翻译的文本预处理小工具，把「清洗原文 → 待翻译 xlsx」和「译文 xlsx → sqlite 预翻译文件」两步重复劳动自动化。
-
-**完全离线**：不联网、不上传、不写注册表。
+为 [LunaTranslator](https://github.com/HIllya51/LunaTranslator) 制作预翻译文件的工具。
 
 ## 简易流程
 
