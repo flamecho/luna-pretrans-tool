@@ -29,7 +29,7 @@
 
 ## 下载
 
-到 [Releases](../../releases) 下载最新的 `Luna预翻译工具.exe`（免安装，Windows 10 / 11 x64）。
+到 [Releases](../../releases) 下载最新的 `LunaPretransTool.zip`（免安装，Windows 10 / 11 x64）。
 
 ## 从源码运行 / 打包
 
