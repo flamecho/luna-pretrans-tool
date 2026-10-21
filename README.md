@@ -1,6 +1,6 @@
 # Luna 预翻译工具
 
-给 [LunaTranslator](https://github.com/HIllya51/LunaTranslator) 生成 sqlite 预翻译文件 的小工具。
+给 [LunaTranslator](https://github.com/HIllya51/LunaTranslator) 生成 sqlite预翻译文件 的小工具。
 
 ## 流程
 
