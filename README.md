@@ -1,6 +1,6 @@
 # Luna 预翻译工具
 
-给 [LunaTranslator](https://github.com/HIllya51/LunaTranslator) 生成预翻译 sqlite 的小工具。完全离线：不联网、不上传文本、不写注册表。
+给 [LunaTranslator](https://github.com/HIllya51/LunaTranslator) 生成 sqlite 预翻译文件 的小工具。
 
 ## 流程
 
@@ -15,7 +15,7 @@
 | 表格 | `.xlsx`，原文在 A 列 | `.xlsx`，A 列原文 / B 列译文 |
 | 纯文本 | `.txt`，一行一条 | 原文 `.txt` + 译文 `.txt`，两个文件夹 |
 
-纯文本链路不依赖表格，适合只认 txt 的翻译器。两条链路用的替换规则和最终结果完全一致，可以按需混用。
+两条链路用的替换规则和最终结果完全一致，可以按需混用。
 
 ## 用法
 
