@@ -1,10 +1,11 @@
 # -*- coding: utf-8 -*-
 """
-Luna 预翻译工具 v1.0
+Luna 预翻译工具 v1.1
 ---------------------
-① 译前处理：原文本 txt -> 清洗 -> xlsx（原文 A 列，供翻译）
-② 译后处理：译文 xlsx（A 原文 / B 译文）-> 替换规则 -> sqlite（machineTrans）
-③ 日志
+① 译前处理：原文本 txt -> 清洗 -> xlsx（原文 A 列）/ txt（一行一条）
+② 译后处理（xlsx）：译文 xlsx（A 原文 / B 译文）-> 替换规则 -> sqlite（machineTrans）
+③ 译后处理（txt）：待翻译原文 txt + 译文 txt -> 替换规则 -> sqlite（machineTrans）
+④ 日志
 
 完全离线运行：不联网、不上传、不写注册表、不读取任何个人目录。
 
@@ -28,9 +29,12 @@ from tkinter import filedialog, messagebox, scrolledtext, ttk
 import openpyxl
 
 APP_NAME = 'Luna 预翻译工具'
-APP_VERSION = '1.0'
+APP_VERSION = '1.1'
 IDEOSPACE = '\u3000'
 EMPTY_MT = '{"rengong": ""}'
+
+# 命令行 --selftest 的模式（xlsx / txt / both）-> 实际导出的扩展名集合
+FMT_MAP = (('xlsx',), ('txt',), ('xlsx', 'txt'))
 
 # ============================ 字体 ============================
 # 中文界面：正文 11pt 起，次要文字 10pt。
@@ -319,6 +323,25 @@ def build_xlsx(template, out_path, lines):
     wb.save(out_path)
 
 
+def build_txt(out_path, lines):
+    """写待翻译 txt：一行一条，UTF-8(BOM) + LF，末尾保留一个换行。"""
+    with open(out_path, 'w', encoding='utf-8-sig', newline='\n') as f:
+        if lines:
+            f.write('\n'.join(lines) + '\n')
+
+
+def read_lines_txt(path):
+    """读一行一条的 txt。
+
+    只剔除文件末尾的连续空行（翻译器导出常带尾换行），中间的空行原样保留，
+    因为「空行占一行」在译后阶段代表该行未翻译，需要占位对齐。
+    """
+    lines = split_lines(read_text(path))
+    while lines and not lines[-1].strip():
+        lines.pop()
+    return lines
+
+
 def fill_sqlite(template, out_path, lines):
     shutil.copyfile(template, out_path)
     con = sqlite3.connect(out_path)
@@ -357,16 +380,53 @@ def collect(src_dir, recursive, exts):
     return items
 
 
+def index_txt(folder, recursive):
+    """把文件夹下的 txt 建成 {相对路径去扩展名(统一用 /): 绝对路径}。"""
+    m = {}
+    for full, rel in collect(folder, recursive, ('.txt',)):
+        m[os.path.splitext(rel)[0].replace('\\', '/')] = full
+    return m
+
+
+def pair_txt(orig_dir, trans_dir, recursive):
+    """按同名（相对路径 + 去扩展名）把原文 txt 与译文 txt 配对。
+
+    返回 (pairs, missing, extra)：
+      pairs   [(原文路径, 译文路径, 相对路径), ...] 按名字排序
+      missing 有原文但没有译文的相对路径
+      extra   有译文但没有原文的相对路径
+    """
+    o = index_txt(orig_dir, recursive)
+    t = index_txt(trans_dir, recursive)
+    pairs = [(o[k], t[k], k + '.txt') for k in sorted(o) if k in t]
+    missing = [k + '.txt' for k in sorted(o) if k not in t]
+    extra = [k + '.txt' for k in sorted(t) if k not in o]
+    return pairs, missing, extra
+
+
 def process_import(src_file, rel, cfg, log):
     raw_lines = split_lines(read_text(src_file))
     lines, st = clean_lines(raw_lines, cfg['drop_ideo'], cfg['drop_blank'], cfg['drop_dup'])
     stem = os.path.splitext(rel)[0]
-    p = os.path.join(cfg['out_dir'], stem + '.xlsx')
-    os.makedirs(os.path.dirname(p), exist_ok=True)
-    build_xlsx(BUILTIN_XLSX, p, lines)
+    fmts = cfg.get('formats') or ('xlsx',)
+    made = []
+    for fmt in ('xlsx', 'txt'):
+        if fmt not in fmts:
+            continue
+        p = os.path.join(cfg['out_dir'], stem + '.' + fmt)
+        # 导出 txt 时输出目录若等于源目录，会直接覆盖掉用户的原文，必须拦住
+        if os.path.abspath(p) == os.path.abspath(src_file):
+            raise RuntimeError(f'{rel}: 输出路径与源文件相同，请换一个输出文件夹')
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        if fmt == 'xlsx':
+            build_xlsx(BUILTIN_XLSX, p, lines)
+        else:
+            build_txt(p, lines)
+        made.append(fmt)
     st['final'] = len(lines)
     log(f'  {rel}: {len(raw_lines)} → {len(lines)} 行'
-        f'（全角空格 {st["ideo"]} / 空行 {st["blank"]} / 重复 {st["dup"]}）')
+        f'（全角空格 {st["ideo"]} / 空行 {st["blank"]} / 重复 {st["dup"]}）'
+        f' → {"+".join(made)}')
     return st
 
 
@@ -386,7 +446,6 @@ def is_empty_mt(mt):
 
 
 def process_translation(xlsx_path, rel, cfg, log):
-    stem = os.path.splitext(rel)[0]
     wb = openpyxl.load_workbook(xlsx_path, data_only=True)
     ws = wb.active
     if ws.max_column < 2:
@@ -394,20 +453,40 @@ def process_translation(xlsx_path, rel, cfg, log):
     colA = [ws.cell(r, 1).value or '' for r in range(1, ws.max_row + 1)]
     colB = [ws.cell(r, 2).value or '' for r in range(1, ws.max_row + 1)]
     wb.close()
+    return write_sqlite(colA, colB, os.path.splitext(rel)[0], rel, cfg, log)
 
-    entries = [apply_rules(v, cfg['rules']) for v in colB]
+
+def process_translation_txt(orig_txt, trans_txt, rel, cfg, log):
+    """原文 txt 顶 A 列，译文 txt 顶 B 列。
+
+    译文里的空行照样占一行，交给 write_sqlite 回填原文，保证行号不串。
+    """
+    colA = read_lines_txt(orig_txt)
+    colB = read_lines_txt(trans_txt)
+    if not colA:
+        raise RuntimeError(f'{rel}: 原文 txt 是空的')
+    if not colB:
+        log(f'  ⚠ {rel}: 译文 txt 是空的，全部按未翻译回填')
+    return write_sqlite(colA, colB, os.path.splitext(rel)[0], rel, cfg, log)
+
+
+def write_sqlite(colA, colB, stem, rel, cfg, log):
+    """colA -> source/origin，colB 经替换规则 -> machineTrans。"""
+    entries = [apply_rules('' if v is None else str(v), cfg['rules']) for v in colB]
 
     out_sqlite = os.path.join(cfg['out_dir'], stem + '.sqlite')
     os.makedirs(os.path.dirname(out_sqlite), exist_ok=True)
     fill_sqlite(BUILTIN_SQLITE, out_sqlite, colA)
+
+    if len(colA) != len(colB):
+        log(f'  ⚠ {rel}: 原文 {len(colA)} 行 / 译文 {len(colB)} 行，'
+            f'按 {min(len(colA), len(colB))} 对齐')
 
     con = sqlite3.connect(out_sqlite)
     try:
         cur = con.cursor()
         rows = cur.execute('SELECT id, origin FROM artificialtrans ORDER BY id').fetchall()
         n = min(len(rows), len(entries))
-        if len(rows) != len(entries):
-            log(f'  ⚠ {rel}: 底库 {len(rows)} 行 / 译文 {len(entries)} 条，按 {n} 对齐')
         diff_a = sum(1 for i in range(min(n, len(colA))) if colA[i] != rows[i][1])
         filled = 0
         upd = []
@@ -429,21 +508,43 @@ def process_translation(xlsx_path, rel, cfg, log):
 
 
 # ============================ 命令行自检 ============================
-def run_cli(kind, src, out_dir, extra=None):
+def load_rules_file(path):
+    if path and os.path.isfile(path):
+        return json.load(open(path, encoding='utf-8'))
+    return [dict(r) for r in DEFAULT_RULES]
+
+
+def run_cli(kind, argv):
     logs = []
 
     def log(m):
         logs.append(m)
 
     if kind == 'import':
-        cfg = {'out_dir': out_dir, 'drop_ideo': True, 'drop_blank': True, 'drop_dup': True}
+        src, out_dir = argv[0], argv[1]
+        fmts = FMT_MAP[{'xlsx': 0, 'txt': 1, 'both': 2}.get(
+            argv[2] if len(argv) > 2 else 'xlsx', 0)]
+        cfg = {'out_dir': out_dir, 'drop_ideo': True, 'drop_blank': True,
+               'drop_dup': True, 'formats': fmts}
         for full, rel in collect(src, True, ('.txt',)):
             process_import(full, rel, cfg, log)
-    else:
-        rules = json.load(open(extra, encoding='utf-8')) if (extra and os.path.isfile(extra)) else DEFAULT_RULES
-        cfg = {'out_dir': out_dir, 'rules': rules}
+    elif kind == 'trans':
+        src, out_dir = argv[0], argv[1]
+        cfg = {'out_dir': out_dir,
+               'rules': load_rules_file(argv[2] if len(argv) > 2 else None)}
         for full, rel in collect(src, True, ('.xlsx',)):
             process_translation(full, rel, cfg, log)
+    else:                       # trans-txt：原文文件夹 + 译文文件夹 + 输出文件夹
+        orig_dir, trans_dir, out_dir = argv[0], argv[1], argv[2]
+        cfg = {'out_dir': out_dir,
+               'rules': load_rules_file(argv[3] if len(argv) > 3 else None)}
+        pairs, missing, extra = pair_txt(orig_dir, trans_dir, True)
+        if missing:
+            log('⚠ 有原文无译文（跳过）：' + ', '.join(missing))
+        if extra:
+            log('· 有译文无原文（忽略）：' + ', '.join(extra))
+        for o, t, rel in pairs:
+            process_translation_txt(o, t, rel, cfg, log)
 
     os.makedirs(out_dir, exist_ok=True)
     with open(os.path.join(out_dir, '_selftest.log'), 'w', encoding='utf-8') as f:
@@ -546,9 +647,16 @@ class App:
         self.style = ttk.Style()
         self.themed = []           # 带 set_colors(c) 的自定义控件
         self.plain = {'bg': [], 'surface': []}
+        self.fixups = {}           # frame -> 该页的重排回调（动态显隐控件用）
+        self.cur = 0               # 当前页索引
         root.title(f'{APP_NAME}  v{APP_VERSION}')
-        root.geometry('1000x900')
-        root.minsize(920, 800)
+        # 尺寸按实际屏幕收敛：写死 1000x900 在小屏或高缩放下会超出屏幕，
+        # 窗口一出现就被系统压缩，布局要重算一轮。
+        sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
+        w = min(1000, max(660, sw - 80))
+        h = min(900, max(540, sh - 110))
+        root.geometry(f'{w}x{h}')
+        root.minsize(min(920, w), min(760, h))
         root.configure(background=self.c['bg'])
 
         self.v_src = tk.StringVar()
@@ -557,16 +665,21 @@ class App:
         self.v_blank = tk.BooleanVar(value=True)
         self.v_dup = tk.BooleanVar(value=True)
         self.v_recursive = tk.BooleanVar(value=False)
+        self.v_fmt_xlsx = tk.BooleanVar(value=True)    # 译前输出格式：可多选
+        self.v_fmt_txt = tk.BooleanVar(value=False)
 
-        self.v_tsrc = tk.StringVar()
+        self.v_tsrc = tk.StringVar()       # 译后：译文 xlsx 文件夹
+        self.v_osrc = tk.StringVar()       # 译后 txt 模式：待翻译原文 txt 文件夹
+        self.v_ttxt = tk.StringVar()       # 译后 txt 模式：译文 txt 文件夹
         self.v_tout = tk.StringVar()
         self.v_trecursive = tk.BooleanVar(value=False)
+        self.in_mode = 0                   # 译后输入格式：0 = xlsx，1 = 原文 + 译文 txt
 
         self.v_progress = tk.DoubleVar(value=0)
         self.v_status = tk.StringVar(value='就绪')
 
         self._build()
-        self.apply_theme(self.theme)
+        self.apply_theme(self.theme, initial=True)
         self.v_status.trace_add('write', self._sync_status)
         self.v_progress.trace_add('write', self._sync_progress)
         self._sync_status()
@@ -611,7 +724,9 @@ class App:
         self.root.destroy()
 
     # ---------- 主题 ----------
-    def apply_theme(self, mode):
+    def apply_theme(self, mode, initial=False):
+        """initial=True 用于启动：控件创建时已按当前配色上过色，跳过全量遍历，
+        省掉一次无谓的 set_colors / configure 风暴（实测约 200ms）。"""
         self.theme = mode
         c = self.c = THEMES[mode]
         self.root.configure(background=c['bg'])
@@ -664,6 +779,8 @@ class App:
         s.map('Vertical.TScrollbar', background=[('active', c['border_strong'])])
         s.configure('Horizontal.TProgressbar', background=c['accent'], troughcolor=c['border'],
                     bordercolor=c['border'], thickness=12)
+        if initial:
+            return
         for w in self.themed:
             try:
                 w.set_colors(c)
@@ -734,12 +851,13 @@ class App:
         # 页面容器（每页可纵向滚动：窗口高度不足时在右侧出现滚动条）
         self.pages = self._frame(self.root, 'bg')
         self.pages.pack(fill='both', expand=True, padx=22)
-        self.frames = []
-        for build in (self._page_pre, self._page_post, self._page_log):
-            f = self._frame(self.pages, 'bg')
-            f.place(relx=0, rely=0, relwidth=1, relheight=1)
-            self._scrollable(f, build)
-            self.frames.append(f)
+        # 页面容器按需构建：启动时只建译前页和日志页（日志随时可能被写入），
+        # 译后页等第一次切过去再建，省掉约一半的启动布局开销。
+        self._builders = [self._page_pre, self._page_post, self._page_log]
+        self._built = [False, False, False]
+        self.frames = [self._frame(self.pages, 'bg') for _ in self._builders]
+        self._build_page(0)
+        self._build_page(2)
         self.show_page(0)
 
         # 底部状态
@@ -756,28 +874,70 @@ class App:
         self.bar.pack(fill='x', pady=(9, 0))
 
     def _scrollable(self, parent, build):
-        """在 parent 内放 Canvas + 右侧滚动条；内容超出可视高度时滚动条才出现。"""
+        """在 parent 内放 Canvas + 右侧滚动条；内容超出可视高度时滚动条才出现。
+
+        布局回调做了三层防抖。否则窗口缩放会触发级联重排——实测一次改尺寸
+        能引出近 2000 次 Configure、单帧耗时 400 ms 以上：
+          · 同一轮事件只排一个 idle 任务，多次 Configure 合并成一次计算
+          · 内容宽度仅在真的变化时写回 canvas，避免 inner 反复触发 <Configure>
+          · scrollregion 仅在范围变化时设置
+        回调里也不能调用 update_idletasks()：那会在事件处理中同步重排整页。
+        """
         cv = tk.Canvas(parent, highlightthickness=0, borderwidth=0,
                        background=self.c['bg'])
         self.plain['bg'].append(cv)
         vsb = ttk.Scrollbar(parent, orient='vertical', command=cv.yview)
         cv.configure(yscrollcommand=vsb.set)
-        cv.pack(side='left', fill='both', expand=True)
-        vsb.pack(side='right', fill='y', padx=(8, 0))   # 与左侧内容留出间距
+        cv.pack(fill='both', expand=True)
+        # 滚动条用 place 浮在右边缘：显隐不改变 Canvas 宽度，
+        # 否则「滚动条切换 → Canvas 变窄 → 内容重排 → 又需要滚动条」会来回震荡。
+        BAR_W = 12
+        vsb.place(relx=1.0, rely=0.0, anchor='ne', relheight=1.0, width=BAR_W)
         inner = self._frame(cv, 'bg')
         win = cv.create_window(0, 0, window=inner, anchor='nw')
 
+        st = {'w': -1, 'region': None, 'job': None, 'busy': False}
+
+        def _apply():
+            st['job'] = None
+            if st['busy']:
+                return
+            st['busy'] = True
+            try:
+                w = cv.winfo_width() - BAR_W - 2
+                resized = w > 1 and w != st['w']
+                if resized:
+                    st['w'] = w
+                    cv.itemconfigure(win, width=w)
+                bb = cv.bbox('all')
+                region = bb if bb else (0, 0, 1, 1)
+                if region != st['region']:
+                    st['region'] = region
+                    cv.configure(scrollregion=region)
+                h = cv.winfo_height()
+                need = bool(bb) and h > 1 and bb[3] > h + 4
+                if need != (vsb.winfo_manager() == 'place'):
+                    if need:
+                        vsb.place(relx=1.0, rely=0.0, anchor='ne',
+                                  relheight=1.0, width=BAR_W)
+                    else:
+                        vsb.place_forget()
+                # 宽度变了会让文本重排、高度跟着变，排一次校准拿准确高度
+                if resized:
+                    st['job'] = cv.after_idle(_apply)
+            finally:
+                st['busy'] = False
+
         def _sync(event=None):
-            cv.update_idletasks()
-            bb = cv.bbox('all')
-            cv.configure(scrollregion=bb if bb else (0, 0, 1, 1))
-            cv.itemconfigure(win, width=cv.winfo_width())
-            need = bool(bb) and cv.winfo_height() > 0 and bb[3] > cv.winfo_height() + 4
-            packed = vsb.winfo_manager() == 'pack'
-            if need and not packed:
-                vsb.pack(side='right', fill='y', padx=(8, 0))
-            elif not need and packed:
-                vsb.pack_forget()
+            # Configure 事件走 60ms 防抖：拖拽窗口时把中间帧合并掉，停手后再重排，
+            # 否则每帧都要重算整页（内容宽度一变就得重新测量所有文本）。
+            # 构建 / 切页等主动调用（无 event）立即执行，避免出现空白页。
+            if st['job'] is not None:
+                try:
+                    cv.after_cancel(st['job'])
+                except Exception:
+                    pass
+            st['job'] = cv.after(60 if event is not None else 0, _apply)
 
         def _needs_scroll():
             """内容是否真的溢出视口——只有溢出时才允许滚轮滚动。"""
@@ -810,11 +970,40 @@ class App:
             for ch in w.winfo_children():
                 _bind_wheel(ch)
 
-        inner.bind('<Configure>', _sync)
+        # 只监听 Canvas 的 Configure：inner 的尺寸变化是我们自己 itemconfigure
+        # 写宽度造成的，再监听一次会把每帧的重排量翻倍。
         cv.bind('<Configure>', _sync)
         build(inner)
         _bind_wheel(inner)
+        # 滚轮只在构建时绑一次：控件不会因为显隐而重建，切页/切模式无需重绑。
+        self.fixups[parent] = _sync
         cv.after(80, _sync)       # 布局完成后校准一次
+
+    def _build_page(self, i):
+        """首次访问某一页时才真正构建它的内容。"""
+        if self._built[i]:
+            return
+        self._built[i] = True
+        f = self.frames[i]
+        f.place(relx=0, rely=0, relwidth=1, relheight=1)
+        self._scrollable(f, self._builders[i])
+
+    def _refit(self):
+        """当前页内容变化后重算滚动区域（pack 生效有延迟，跑两遍）。
+
+        只处理当前页：切页时如果三页都重算一遍，单次切页要多花一百多毫秒。
+        """
+        fn = self.fixups.get(self.frames[self.cur])
+        if fn is None:
+            return
+
+        def run():
+            try:
+                fn()
+            except Exception:
+                pass
+        run()
+        self.root.after(60, run)
 
     def _page_head(self, parent, title, desc):
         f = self._frame(parent, 'bg')
@@ -836,16 +1025,18 @@ class App:
         return card
 
     def _field(self, parent, label, var, cmd):
+        """返回 (box, label, entry)：后两者供切换输入模式时改文案与绑定变量。"""
         box = self._frame(parent, 'surface')
         box.pack(fill='x', pady=(0, 12))
-        self._label(box, 'surface', text=label, font=FONT_SM,
-                    color='label').pack(anchor='w', pady=(0, 6))
+        lbl = self._label(box, 'surface', text=label, font=FONT_SM, color='label')
+        lbl.pack(anchor='w', pady=(0, 6))
         row = self._frame(box, 'surface')
         row.pack(fill='x')
-        ttk.Entry(row, textvariable=var, font=FONT).pack(side='left', fill='x',
-                                                         expand=True, padx=(0, 10))
+        ent = ttk.Entry(row, textvariable=var, font=FONT)
+        ent.pack(side='left', fill='x', expand=True, padx=(0, 10))
         b = Button(row, self.c, text='浏览', command=cmd, kind='ghost')
         b.pack(side='left')
+        return box, lbl, ent
 
     def _checks(self, parent, items, vertical=False):
         box = self._frame(parent, 'surface')
@@ -871,11 +1062,20 @@ class App:
 
     # ---- 页1：译前处理 ----
     def _page_pre(self, p):
-        self._page_head(p, '译前处理', '将原文 txt 导出为待翻译的 xlsx，原文统一放在 A 列。')
+        self._page_head(p, '译前处理',
+                        '将原文 txt 清洗后导出为待翻译文本：xlsx 写在 A 列，'
+                        'txt 一行一条（UTF-8 BOM + LF），两个都勾则同时导出。')
         c1 = self._card(p, '选择文件')
         self._field(c1.inner, '原文 txt 文件夹', self.v_src, self.pick_src)
         self._field(c1.inner, '输出文件夹', self.v_out, self.pick_out)
-        self._checks(c1.inner, [('包含子文件夹', self.v_recursive)])
+        row = self._checks(c1.inner, [('包含子文件夹', self.v_recursive)])
+        # 输出格式与「包含子文件夹」同排：两个都勾就同时导出
+        self._label(row, 'surface', text='输出格式', font=FONT_SM,
+                    muted=True).pack(side='left', padx=(4, 12))
+        ttk.Checkbutton(row, text='xlsx', variable=self.v_fmt_xlsx,
+                        style='TCheckbutton').pack(side='left', padx=(0, 22))
+        ttk.Checkbutton(row, text='txt', variable=self.v_fmt_txt,
+                        style='TCheckbutton').pack(side='left')
 
         c2 = self._card(p, '清洗规则', hint='三项可按需单独关闭')
         self._checks(c2.inner, [('去除全角空格（保留半角空格）', self.v_ideo),
@@ -892,11 +1092,27 @@ class App:
     # ---- 页2：译后处理 ----
     def _page_post(self, p):
         self._page_head(p, '译后处理',
-                        '按替换规则将译文 xlsx 导出为 sqlite 预翻译文件。')
+                        '按替换规则把原文与译文合并成 sqlite 预翻译文件：'
+                        '支持译文 xlsx，或原文 txt + 译文 txt。')
+        c0 = self._card(p, '输入格式')
+        self.seg_in = Segmented(c0.inner, self.c, ['译文 xlsx', '原文 + 译文 txt'],
+                                command=self._set_in_mode)
+        self.themed.append(self.seg_in)
+        self.seg_in.pack(fill='x')
+        self._label(c0.inner, 'surface',
+                    text='xlsx：A 列原文 / B 列译文。\n'
+                         'txt：原文 txt 与译文 txt 分别放在两个文件夹，按同名文件配对，一行对一行。',
+                    font=FONT_SM, muted=True, justify='left').pack(anchor='w', pady=(10, 0))
+
         c1 = self._card(p, '选择文件')
-        self._field(c1.inner, '译文 xlsx 文件夹', self.v_tsrc, self.pick_tsrc)
-        self._field(c1.inner, '输出文件夹', self.v_tout, self.pick_tout)
+        self.box_tsrc, self.lbl_tsrc, self.ent_tsrc = self._field(
+            c1.inner, '译文 xlsx 文件夹', self.v_tsrc, self.pick_src_any)
+        self.box_ttxt, _l1, _e1 = self._field(
+            c1.inner, '译文 txt 文件夹', self.v_ttxt, self.pick_ttxt)
+        self.box_tout, _l2, _e2 = self._field(
+            c1.inner, '输出文件夹', self.v_tout, self.pick_tout)
         self._checks(c1.inner, [('包含子文件夹', self.v_trecursive)])
+        self.box_ttxt.pack_forget()      # 默认 xlsx 模式不显示「译文 txt」这一行
 
         c2 = self._card(p, '替换规则', hint='顺序敏感，双击行可编辑')
         wrap = self._frame(c2.inner, 'surface')
@@ -971,7 +1187,36 @@ class App:
 
     def show_page(self, i):
         self.seg.select(i)
-        self.frames[i].tkraise()
+        self._build_page(i)
+        self.cur = i
+        # 只让当前页参与布局：三页用 place 叠在一起时，缩放窗口会把隐藏页
+        # 也一起重排一遍，实测单帧开销直接翻三倍。
+        for j, f in enumerate(self.frames):
+            if j == i:
+                f.place(relx=0, rely=0, relwidth=1, relheight=1)
+                f.tkraise()
+            else:
+                f.place_forget()
+        self._refit()
+
+    # ---------- 格式切换 ----------
+    def _formats(self):
+        """当前勾选的译前输出格式，按固定顺序返回，空表示一个都没勾。"""
+        return tuple(f for f, v in (('xlsx', self.v_fmt_xlsx), ('txt', self.v_fmt_txt))
+                     if v.get())
+
+    def _set_in_mode(self, i):
+        self.in_mode = i
+        if i == 1:
+            # txt 模式：第一行换成「原文 txt」，并显示「译文 txt」那一行
+            self.lbl_tsrc.configure(text='原文 txt 文件夹')
+            self.ent_tsrc.configure(textvariable=self.v_osrc)
+            self.box_ttxt.pack(fill='x', pady=(0, 12), before=self.box_tout)
+        else:
+            self.lbl_tsrc.configure(text='译文 xlsx 文件夹')
+            self.ent_tsrc.configure(textvariable=self.v_tsrc)
+            self.box_ttxt.pack_forget()
+        self._refit()
 
     # ---------- 规则 ----------
     def refresh_rules(self):
@@ -1051,6 +1296,13 @@ class App:
         if d:
             self.v_out.set(os.path.normpath(d))
 
+    def pick_src_any(self):
+        """译后页第一行的「浏览」：按当前输入模式跳到对应的选择器。"""
+        if self.in_mode == 1:
+            self.pick_osrc()
+        else:
+            self.pick_tsrc()
+
     def pick_tsrc(self):
         d = filedialog.askdirectory(title='选择译文 xlsx 所在文件夹')
         if d:
@@ -1058,6 +1310,19 @@ class App:
             self.v_tsrc.set(d)
             if not self.v_tout.get():
                 self.v_tout.set(os.path.normpath(os.path.join(d, 'sqlite预翻译')))
+
+    def pick_osrc(self):
+        d = filedialog.askdirectory(title='选择原文 txt 文件夹')
+        if d:
+            d = os.path.normpath(d)
+            self.v_osrc.set(d)
+            if not self.v_tout.get():
+                self.v_tout.set(os.path.normpath(os.path.join(d, 'sqlite预翻译')))
+
+    def pick_ttxt(self):
+        d = filedialog.askdirectory(title='选择译文 txt 文件夹')
+        if d:
+            self.v_ttxt.set(os.path.normpath(d))
 
     def pick_tout(self):
         d = filedialog.askdirectory(title='选择输出文件夹')
@@ -1079,13 +1344,19 @@ class App:
         self.log.delete('1.0', 'end')
         self.log.configure(state='disabled')
 
-    def append_log(self, msg):
+    def append_logs(self, msgs):
+        """一次写入多条日志：逐条 insert + see 会让长跑任务把界面拖住。"""
+        if not msgs:
+            return
         self.log.configure(state='normal')
         if 'hint' in self.log.tag_names('1.0'):
             self.log.delete('1.0', 'end')
-        self.log.insert('end', msg + '\n')
+        self.log.insert('end', '\n'.join(msgs) + '\n')
         self.log.see('end')
         self.log.configure(state='disabled')
+
+    def append_log(self, msg):
+        self.append_logs([msg])
 
     def _log_sep(self, title):
         """在新一轮处理前插入分隔标记，保留之前的日志。"""
@@ -1098,28 +1369,37 @@ class App:
         self.log.configure(state='disabled')
 
     def _poll(self):
+        logs = []
+        done = None
         try:
             while True:
                 kind, payload = self.q.get_nowait()
                 if kind == 'log':
-                    self.append_log(payload)
+                    logs.append(payload)
                 elif kind == 'status':
                     self.v_status.set(payload)
                 elif kind == 'progress':
                     self.v_progress.set(payload)
                 elif kind == 'done':
-                    self.btn_run1.set_state(True)
-                    self.btn_run2.set_state(True)
-                    self.btn_stop1.set_state(False)
-                    self.btn_stop2.set_state(False)
-                    self.v_status.set(payload)
-                    if payload.startswith('完成'):
-                        messagebox.showinfo(APP_NAME, payload)
-                    else:
-                        messagebox.showwarning(APP_NAME, payload)
-                        self.show_page(2)
+                    done = payload
         except queue.Empty:
             pass
+        # 同一轮取出的日志合并成一次插入，再统一处理结束状态
+        if logs:
+            self.append_logs(logs)
+        if done is not None:
+            # 译后页可能还是懒构建的（从未打开过），按钮不一定存在
+            for name, alive in (('btn_run1', True), ('btn_run2', True),
+                                ('btn_stop1', False), ('btn_stop2', False)):
+                b = getattr(self, name, None)
+                if b is not None:
+                    b.set_state(alive)
+            self.v_status.set(done)
+            if done.startswith('完成'):
+                messagebox.showinfo(APP_NAME, done)
+            else:
+                messagebox.showwarning(APP_NAME, done)
+                self.show_page(2)
         self.root.after(100, self._poll)
 
     def stop(self):
@@ -1144,10 +1424,22 @@ class App:
         if not out:
             messagebox.showwarning(APP_NAME, '请先选择输出文件夹。')
             return
+        # 导出 txt 时若输出目录就是源目录，会把用户的原文直接覆盖掉
+        formats = self._formats()
+        if not formats:
+            messagebox.showwarning(APP_NAME, '请至少勾选一种输出格式（xlsx 或 txt）。')
+            return
+        if 'txt' in formats and os.path.abspath(out) == os.path.abspath(src):
+            messagebox.showwarning(
+                APP_NAME, '输出文件夹不能和原文文件夹相同：\n'
+                          '导出 txt 会直接覆盖你的原文，请另选一个输出文件夹。')
+            return
         cfg = {'out_dir': out, 'drop_ideo': self.v_ideo.get(),
-               'drop_blank': self.v_blank.get(), 'drop_dup': self.v_dup.get()}
+               'drop_blank': self.v_blank.get(), 'drop_dup': self.v_dup.get(),
+               'formats': formats}
         self._launch(self.btn_run1, self.btn_stop1, self._run_import,
-                     (src, cfg, self.v_recursive.get()), '译前处理')
+                     (src, cfg, self.v_recursive.get()),
+                     '译前处理（' + '+'.join(formats) + '）')
 
     def _run_import(self, src, cfg, recursive):
         def log(m):
@@ -1157,7 +1449,8 @@ class App:
             if not items:
                 self.q.put(('done', '未在源文件夹找到 .txt 文件'))
                 return
-            log(f'译前处理：共 {len(items)} 个文件')
+            fmt_txt = '+'.join(cfg['formats'])
+            log(f'译前处理：共 {len(items)} 个文件，输出 {fmt_txt}')
             total = 0
             for i, (full, rel) in enumerate(items, 1):
                 if self.stop_flag.is_set():
@@ -1167,23 +1460,42 @@ class App:
                 self.q.put(('progress', (i - 1) * 100.0 / len(items)))
                 total += process_import(full, rel, cfg, log)['final']
                 self.q.put(('progress', i * 100.0 / len(items)))
-            self.q.put(('done', f'完成：{len(items)} 个 xlsx，共 {total} 行'))
+            self.q.put(('done', f'完成：{len(items)} 个文件（{fmt_txt}），共 {total} 行'))
         except Exception:
             log(traceback.format_exc())
             self.q.put(('done', '出错：详见日志'))
 
     def start_trans(self):
-        src, out = self.v_tsrc.get().strip(), self.v_tout.get().strip()
-        if not src or not os.path.isdir(src):
-            messagebox.showwarning(APP_NAME, '请先选择译文 xlsx 所在文件夹。')
-            return
+        out = self.v_tout.get().strip()
         if not out:
             messagebox.showwarning(APP_NAME, '请先选择输出文件夹。')
             return
         self.save_rules()
         cfg = {'out_dir': out, 'rules': self.rules}
-        self._launch(self.btn_run2, self.btn_stop2, self._run_trans,
-                     (src, cfg, self.v_trecursive.get()), '译后处理')
+        recursive = self.v_trecursive.get()
+        if self.in_mode == 0:
+            src = self.v_tsrc.get().strip()
+            if not src or not os.path.isdir(src):
+                messagebox.showwarning(APP_NAME, '请先选择译文 xlsx 所在文件夹。')
+                return
+        else:
+            src = self.v_osrc.get().strip()
+            tsrc = self.v_ttxt.get().strip()
+            if not src or not os.path.isdir(src):
+                messagebox.showwarning(APP_NAME, '请先选择原文 txt 文件夹。')
+                return
+            if not tsrc or not os.path.isdir(tsrc):
+                messagebox.showwarning(APP_NAME, '请先选择译文 txt 文件夹。')
+                return
+            if os.path.abspath(src) == os.path.abspath(tsrc):
+                messagebox.showwarning(APP_NAME, '原文文件夹和译文文件夹不能是同一个。')
+                return
+        if self.in_mode == 0:
+            self._launch(self.btn_run2, self.btn_stop2, self._run_trans,
+                         (src, cfg, recursive), '译后处理（xlsx）')
+        else:
+            self._launch(self.btn_run2, self.btn_stop2, self._run_trans_txt,
+                         (src, tsrc, cfg, recursive), '译后处理（txt）')
 
     def _run_trans(self, src, cfg, recursive):
         def log(m):
@@ -1211,15 +1523,50 @@ class App:
             log(traceback.format_exc())
             self.q.put(('done', '出错：详见日志'))
 
+    def _run_trans_txt(self, osrc, tsrc, cfg, recursive):
+        def log(m):
+            self.q.put(('log', m))
+        try:
+            pairs, missing, extra = pair_txt(osrc, tsrc, recursive)
+            if extra:
+                log(f'  · 忽略 {len(extra)} 个只有译文、没有原文的文件')
+            if missing:
+                head = ', '.join(missing[:8]) + (' …' if len(missing) > 8 else '')
+                log(f'  ⚠ 有原文但没译文（跳过）：{head}')
+            if not pairs:
+                self.q.put(('done', '未找到可配对的原文/译文 txt（文件名需一一对应）'))
+                return
+            log(f'译后处理（txt）：共 {len(pairs)} 对文件；'
+                f'替换规则 {sum(1 for r in cfg["rules"] if r.get("on"))} 条生效')
+            rows = filled = 0
+            for i, (o, t, rel) in enumerate(pairs, 1):
+                if self.stop_flag.is_set():
+                    self.q.put(('done', f'已停止（完成 {i-1}/{len(pairs)}）'))
+                    return
+                self.q.put(('status', f'处理 {i}/{len(pairs)}'))
+                self.q.put(('progress', (i - 1) * 100.0 / len(pairs)))
+                st = process_translation_txt(o, t, rel, cfg, log)
+                rows += st['rows']
+                filled += st['filled']
+                self.q.put(('progress', i * 100.0 / len(pairs)))
+            tail = f'，跳过 {len(missing)} 个未配对' if missing else ''
+            self.q.put(('done', f'完成：{len(pairs)} 个 sqlite，{rows} 行，'
+                                f'回填空译文 {filled} 处{tail}'))
+        except Exception:
+            log(traceback.format_exc())
+            self.q.put(('done', '出错：详见日志'))
+
 
 def main():
     if '--selftest' in sys.argv:
         i = sys.argv.index('--selftest')
-        return run_cli('import', sys.argv[i + 1], sys.argv[i + 2])
+        return run_cli('import', sys.argv[i + 1:])
+    if '--selftest-trans-txt' in sys.argv:
+        i = sys.argv.index('--selftest-trans-txt')
+        return run_cli('trans-txt', sys.argv[i + 1:])
     if '--selftest-trans' in sys.argv:
         i = sys.argv.index('--selftest-trans')
-        return run_cli('trans', sys.argv[i + 1], sys.argv[i + 2],
-                       sys.argv[i + 3] if len(sys.argv) > i + 3 else None)
+        return run_cli('trans', sys.argv[i + 1:])
     enable_dpi()
     root = tk.Tk()
     system_scale(root)
@@ -1229,7 +1576,17 @@ def main():
             root.iconbitmap(icon)
     except Exception:
         pass
+    # 先隐藏窗口，把首次布局一次性算完再显示：否则用户看到的是控件逐块就位、
+    # 排版来回变形的过程（首次布局在慢机器上要一秒以上）。
+    root.withdraw()
     App(root)
+    root.update_idletasks()
+    root.deiconify()
+    root.lift()
+    try:
+        root.focus_force()
+    except Exception:
+        pass
     root.mainloop()
     return 0
 
